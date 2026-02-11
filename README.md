@@ -42,8 +42,14 @@ pip install -r requirements.txt
 uvicorn main:app --reload --port 8000
 ```
 
-Run celery worker in a separate terminal:
+Run Celery worker(s) in separate terminal(s):
 
 ```bash
+# Single worker process
 celery -A tc_service.celery_app worker --loglevel=info
+
+# Scale out with 4 worker processes in one command
+celery -A tc_service.celery_app worker --loglevel=info --concurrency=4
 ```
+
+You can also run multiple worker instances (for example 3-4 terminals/containers), all connected to the same Redis broker, and jobs will be distributed across them automatically.
