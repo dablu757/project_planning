@@ -2,7 +2,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
-from celery import Celery
+from celery import Celery, chain
 
 from tc_dtos import PipelineInputDTO
 from tc_repo import TaskChainRepository
@@ -75,61 +75,120 @@ def _run_schedule_duration_module(
     }
 
 
-@celery_app.task(bind=True, name="tc.run_pipeline")
-def run_pipeline(self, job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+def _mark_job_failed(job_id: str, module_name: str, exc: Exception) -> None:
+    repo.mark_failed(job_id, module_name=module_name, error=str(exc))
+
+
+@celery_app.task(name="tc.run_wsb")
+def run_wsb(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     dto = PipelineInputDTO(**payload)
 
     try:
         repo.update_job_progress(job_id, module_name="wsb", progress=10, status="running")
-        wsb_output = _run_wsb_module(job_id, dto)
+        output = _run_wsb_module(job_id, dto)
         repo.update_job_progress(
             job_id,
             module_name="wsb",
             progress=30,
             status="running",
-            output=wsb_output,
+            output=output,
         )
+    except Exception as exc:  # noqa: BLE001
+        _mark_job_failed(job_id, "wsb", exc)
+        raise
 
-        task_output = _run_task_creation_module(job_id, wsb_output, dto)
+    return output
+
+
+@celery_app.task(name="tc.run_task_creation")
+def run_task_creation(
+    wsb_output: dict[str, Any],
+    job_id: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    dto = PipelineInputDTO(**payload)
+
+    try:
+        output = _run_task_creation_module(job_id, wsb_output, dto)
         repo.update_job_progress(
             job_id,
             module_name="task_creation",
             progress=55,
             status="running",
-            output=task_output,
+            output=output,
         )
+    except Exception as exc:  # noqa: BLE001
+        _mark_job_failed(job_id, "task_creation", exc)
+        raise
 
-        dependency_output = _run_task_dependency_module(job_id, task_output, dto)
+    return output
+
+
+@celery_app.task(name="tc.run_task_dependency")
+def run_task_dependency(
+    task_output: dict[str, Any],
+    job_id: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    dto = PipelineInputDTO(**payload)
+
+    try:
+        output = _run_task_dependency_module(job_id, task_output, dto)
         repo.update_job_progress(
             job_id,
             module_name="task_dependency",
             progress=80,
             status="running",
-            output=dependency_output,
+            output=output,
         )
+    except Exception as exc:  # noqa: BLE001
+        _mark_job_failed(job_id, "task_dependency", exc)
+        raise
 
-        schedule_output = _run_schedule_duration_module(job_id, dependency_output, dto)
+    return output
+
+
+@celery_app.task(name="tc.run_schedule_duration")
+def run_schedule_duration(
+    dependency_output: dict[str, Any],
+    job_id: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    dto = PipelineInputDTO(**payload)
+
+    try:
+        output = _run_schedule_duration_module(job_id, dependency_output, dto)
         repo.update_job_progress(
             job_id,
             module_name="schedule_duration",
             progress=100,
             status="completed",
-            output=schedule_output,
+            output=output,
         )
-
     except Exception as exc:  # noqa: BLE001
-        repo.mark_failed(job_id, module_name="pipeline", error=str(exc))
+        _mark_job_failed(job_id, "schedule_duration", exc)
         raise
 
-    return {
-        "job_id": job_id,
-        "status": "completed",
-    }
+    return output
+
+
+@celery_app.task(name="tc.finalize_pipeline")
+def finalize_pipeline(_: dict[str, Any], job_id: str) -> dict[str, Any]:
+    return {"job_id": job_id, "status": "completed"}
 
 
 def start_pipeline(payload: dict[str, Any]) -> tuple[str, str]:
     job_id = repo.create_job(payload)
-    async_result = run_pipeline.delay(job_id=job_id, payload=payload)
+
+    workflow = chain(
+        run_wsb.s(job_id=job_id, payload=payload),
+        run_task_creation.s(job_id=job_id, payload=payload),
+        run_task_dependency.s(job_id=job_id, payload=payload),
+        run_schedule_duration.s(job_id=job_id, payload=payload),
+        finalize_pipeline.s(job_id=job_id),
+    )
+    async_result = workflow.apply_async()
+
     return job_id, async_result.id
 
 

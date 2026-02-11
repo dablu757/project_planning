@@ -7,13 +7,13 @@ This service implements a 4-step execution flow:
 3. Task dependency
 4. Schedule duration
 
-Execution is decoupled using Celery workers so multiple job requests can run concurrently.
+Execution is decoupled using Celery workers so multiple job requests can run concurrently, and each module can be routed/scaled independently.
 
 ## Features
 
 - `POST /api/v1/tc/jobs` accepts frontend WSB input and creates a job.
 - Input payload is stored in MongoDB `jobs` collection.
-- Celery worker processes modules in sequence (`1 -> 2 -> 3 -> 4`).
+- Celery executes each module as an independent task in a chained sequence (`1 -> 2 -> 3 -> 4`).
 - Module outputs are inserted into MongoDB (`wsb_outputs`, `task_creation_outputs`, `task_dependency_outputs`, `schedule_duration_outputs`).
 - Job progress is tracked in `jobs.progress`.
   - WSB completion explicitly updates progress to **30%**.
@@ -53,3 +53,10 @@ celery -A tc_service.celery_app worker --loglevel=info --concurrency=4
 ```
 
 You can also run multiple worker instances (for example 3-4 terminals/containers), all connected to the same Redis broker, and jobs will be distributed across them automatically.
+
+## Scaling & further decoupling ideas
+
+- Route tasks to dedicated Celery queues (`queue="wsb"`, `"dependency"`, etc.) and run specialized worker pools per module.
+- Use autoscaling worker deployments (Kubernetes HPA, ECS scaling, etc.) based on queue depth.
+- Add retry/backoff per task and idempotency keys to safely recover from transient errors.
+- Move module outputs to an event stream (Kafka/Redis Streams) if downstream services need real-time subscriptions.
